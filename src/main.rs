@@ -1,4 +1,3 @@
-use crossbeam::atomic::AtomicConsume;
 use jemallocator::Jemalloc;
 
 //#[global_allocator]
@@ -23,61 +22,111 @@ pub struct extent_hooks_s {
 }*/
 use std::alloc::{GlobalAlloc, Layout};
 
-use std::cell::{Cell, OnceCell};
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap};
-use std::hash::{DefaultHasher, RandomState};
-use std::process::id;
-use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::sync::RwLock;
-use std::thread::ThreadId;
+use std::sync::atomic::AtomicIsize;
+use std::{
+    io::Write,
+    sync::{
+        atomic::{
+            AtomicUsize,
+            Ordering::{self, Relaxed},
+        },
+        RwLock,
+    },
+    time::Duration,
+};
 
-const MAX_SUPPORTED_ALIGN: usize = 4096;
-
-#[derive(Default, Debug)]
-struct Counters {
-    allocations: AtomicUsize,
-    bytes: AtomicUsize,
-    junk: [usize; 32],
-    junk2: [usize; 64 - 32 - 8 - 8],
+#[derive(Debug)]
+pub struct Counters {
+    allocations_balance: AtomicIsize,
+    allocations_total: AtomicUsize,
+    deallocations_total: AtomicUsize,
+    bytes_balance: AtomicIsize,
+    bytes_allocated_total: AtomicUsize,
+    bytes_deallocated_total: AtomicUsize,
+}
+impl Default for Counters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Counters {
+    const fn new() -> Self {
+        Self {
+            allocations_balance: AtomicIsize::new(0),
+            allocations_total: AtomicUsize::new(0),
+            deallocations_total: AtomicUsize::new(0),
+            bytes_balance: AtomicIsize::new(0),
+            bytes_allocated_total: AtomicUsize::new(0),
+            bytes_deallocated_total: AtomicUsize::new(0),
+        }
+    }
 }
 
+impl Counters {
+    pub fn alloc(&self, size: usize) {
+        self.bytes_allocated_total
+            .fetch_add(size, Ordering::Relaxed);
+        self.allocations_total.fetch_add(1, Ordering::Relaxed);
+
+        self.bytes_balance
+            .fetch_add(size as isize, Ordering::Relaxed);
+        self.allocations_balance.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn dealloc(&self, size: usize) {
+        self.bytes_deallocated_total
+            .fetch_add(size, Ordering::Relaxed);
+        self.deallocations_total.fetch_add(1, Ordering::Relaxed);
+
+        self.bytes_balance
+            .fetch_sub(size as isize, Ordering::Relaxed);
+        self.allocations_balance.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 #[repr(C, align(4096))] // 4096 == MAX_SUPPORTED_ALIGN
 struct JemWrapAllocator {
     jemalloc: Jemalloc,
-    mapping: OnceCell<Vec<(ThreadId, usize)>>,
-    stats: OnceCell<Vec<Counters>>,
-    enable_maps: AtomicBool,
+    pub named_thread_stats: RwLock<Option<MemPoolStats>>,
+    pub unnamed_thread_stats: Counters,
+    pub process_stats: Counters,
 }
 
+fn print_allocations() {
+    let lock_guard = &ALLOCATOR.named_thread_stats.read().unwrap();
+    if let Some(stats) = lock_guard.as_ref() {
+        println!("allocated so far: {:?}", stats);
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct MemPoolStats {
-    stats: BTreeMap<String, Counters>,
+    pub data: Vec<(String, Counters)>,
+}
+
+impl MemPoolStats {
+    fn add(&mut self, prefix: String) {
+        self.data.push((prefix, Counters::default()));
+    }
 }
 
 #[global_allocator]
 static ALLOCATOR: JemWrapAllocator = JemWrapAllocator {
     jemalloc: Jemalloc,
-    mapping: OnceCell::new(),
-    stats: OnceCell::new(),
-    enable_maps: AtomicBool::new(false),
+    named_thread_stats: RwLock::new(None),
+    unnamed_thread_stats: Counters::new(),
+    process_stats: Counters::new(),
 };
 
-pub fn init_mappings(mappings_to_set: Vec<Vec<ThreadId>>) {
-    let mut mapping = Vec::with_capacity(512);
-    let mut stats = Vec::with_capacity(128);
-    for group in mappings_to_set {
-        stats.push(Counters::default());
-        for thread in group {
-            mapping.push((thread, stats.len() - 1));
-        }
-    }
-    ALLOCATOR.stats.set(stats).unwrap();
-    ALLOCATOR.mapping.set(mapping).unwrap();
-    ALLOCATOR.enable_maps.store(true, Ordering::Relaxed);
-}
-pub fn deinit_allocator() {
-    ALLOCATOR.enable_maps.store(false, Ordering::SeqCst);
+pub fn init_allocator() {}
+
+pub fn deinit_allocator() -> MemPoolStats {
+    ALLOCATOR
+        .named_thread_stats
+        .write()
+        .unwrap()
+        .take()
+        .unwrap()
 }
 
 unsafe impl Sync for JemWrapAllocator {}
@@ -88,23 +137,22 @@ unsafe impl GlobalAlloc for JemWrapAllocator {
         if alloc.is_null() {
             return alloc;
         }
-        let mapping = if let Some(s) = self.mapping.get() {
-            s
-        } else {
-            return alloc;
-        };
-        let thread = std::thread::current();
-        let tid = thread.id();
-
-        for (t, idx) in mapping.iter() {
-            if !(*t == tid) {
-                continue;
+        self.process_stats.alloc(layout.size());
+        if let Ok(stats) = self.named_thread_stats.try_read() {
+            if let Some(stats) = stats.as_ref() {
+                let thread = std::thread::current();
+                if let Some(name) = thread.name() {
+                    for (prefix, stats) in stats.data.iter() {
+                        if !name.starts_with(prefix) {
+                            continue;
+                        }
+                        stats.alloc(layout.size());
+                        return alloc;
+                    }
+                }
             }
-            let stats = self.stats.get().unwrap();
-            let c = stats.get(*idx).unwrap();
-            c.bytes.fetch_add(layout.size(), Ordering::Relaxed);
-            c.allocations.fetch_add(1, Ordering::Relaxed);
         }
+        self.unnamed_thread_stats.alloc(layout.size());
         alloc
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -112,42 +160,45 @@ unsafe impl GlobalAlloc for JemWrapAllocator {
         if ptr.is_null() {
             return;
         }
-        if !self.enable_maps.load_consume() {
-            return;
-        }
-        let mapping = if let Some(s) = self.mapping.get() {
-            s
-        } else {
-            return;
-        };
-        if mapping.is_empty() {
-            return;
-        }
-        let thread = std::thread::current();
-        let tid = thread.id();
-
-        for (t, idx) in mapping.iter() {
-            if !(*t == tid) {
-                continue;
+        self.process_stats.dealloc(layout.size());
+        if let Ok(stats) = self.named_thread_stats.try_read() {
+            if let Some(stats) = stats.as_ref() {
+                let thread = std::thread::current();
+                if let Some(name) = thread.name() {
+                    for (prefix, stats) in stats.data.iter() {
+                        if !name.starts_with(prefix) {
+                            continue;
+                        }
+                        stats.dealloc(layout.size())
+                    }
+                }
             }
-            let stats = self.stats.get().unwrap();
-            let c = stats.get(*idx).unwrap();
-            c.bytes.fetch_sub(layout.size(), Ordering::Relaxed);
-            c.allocations.fetch_sub(1, Ordering::Relaxed);
         }
+        self.unnamed_thread_stats.dealloc(layout.size());
     }
 }
 
 fn main() {
-    let cur = std::thread::current();
-    init_mappings(vec![vec![cur.id()]]);
+    let mut cur = std::thread::current();
+
+    let mut mps = MemPoolStats::default();
+    mps.add("Foo".to_owned());
+    ALLOCATOR.named_thread_stats.write().unwrap().replace(mps);
     let _s = format!("allocating a string!");
-    let currently = ALLOCATOR.stats.get().unwrap();
-    println!("allocated so far: {:?}", currently);
-    let _s2 = format!("allocating a string!");
-    let _s3 = format!("allocating a string!");
-    let _s4 = format!("allocating a string!");
-    let currently = ALLOCATOR.stats.get().unwrap();
-    println!("allocated so far: {:?}", currently);
+    print_allocations();
+
+    let jh = std::thread::Builder::new()
+        .name("Foo".to_string())
+        .spawn(|| {
+            let _s2 = format!("allocating a string!");
+            let _s3 = format!("allocating a string!");
+            let _s4 = format!("allocating a string!");
+            std::thread::sleep(Duration::from_millis(200));
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    print_allocations();
+    jh.join().unwrap();
+    print_allocations();
     deinit_allocator();
 }
