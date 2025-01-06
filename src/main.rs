@@ -12,7 +12,7 @@ pub fn print_allocations() {
 
 fn main() {
     let mut mps = MemPoolStats::default();
-    mps.add("Foo".to_owned());
+    mps.add("Foo");
     init_allocator(mps);
     let _s = format!("allocating a string!");
     print_allocations();

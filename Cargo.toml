@@ -7,10 +7,16 @@ edition = "2021"
 
 
 [dependencies]
+array_map = "0.4.0"
+arrayvec.workspace = true
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+heapless = "0.8.0"
 jemallocator = { package = "tikv-jemallocator", version = "0.6.0", features = [
     "unprefixed_malloc_on_supported_platforms",
 ] }
 libc.workspace = true
+lru.workspace = true
 memchr = "2.7.4"
 tikv-jemalloc-sys = { version = "*", features = ["stats"] }
+tinymap = "0.4.0"
+uluru = "3.1.0"

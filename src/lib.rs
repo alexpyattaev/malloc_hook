@@ -1,4 +1,5 @@
 use jemallocator::Jemalloc;
+use uluru::LRUCache;
 
 //#[global_allocator]
 //static GLOBAL: Jemalloc = Jemalloc;
@@ -23,6 +24,7 @@ pub struct extent_hooks_s {
 use std::alloc::{GlobalAlloc, Layout};
 
 use std::sync::atomic::AtomicIsize;
+use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     RwLock,
@@ -32,6 +34,7 @@ static SELF: JemWrapStats = JemWrapStats {
     named_thread_stats: RwLock::new(None),
     unnamed_thread_stats: Counters::new(),
     process_stats: Counters::new(),
+    tid_to_name: Mutex::new(LRUCache::new()),
 };
 
 #[derive(Debug)]
@@ -118,6 +121,7 @@ struct JemWrapStats {
     pub named_thread_stats: RwLock<Option<MemPoolStats>>,
     pub unnamed_thread_stats: Counters,
     pub process_stats: Counters,
+    pub tid_to_name: Mutex<LRUCache<(u64, ThreadName), 512>>,
 }
 
 pub fn view_allocations(f: impl FnOnce(&MemPoolStats)) {
@@ -129,12 +133,17 @@ pub fn view_allocations(f: impl FnOnce(&MemPoolStats)) {
 
 #[derive(Debug, Default)]
 pub struct MemPoolStats {
-    pub data: Vec<(String, Counters)>,
+    pub data: Vec<(ThreadName, Counters)>,
 }
 
 impl MemPoolStats {
-    pub fn add(&mut self, prefix: String) {
-        self.data.push((prefix, Counters::default()));
+    pub fn add(&mut self, prefix: &str) {
+        let key: ThreadName = prefix
+            .as_bytes()
+            .try_into()
+            .expect("Prefix can not be over 32 bytes long");
+
+        self.data.push((key, Counters::default()));
     }
 }
 
@@ -146,23 +155,38 @@ pub fn deinit_allocator() -> MemPoolStats {
     SELF.named_thread_stats.write().unwrap().take().unwrap()
 }
 
+const NAME_LEN: usize = 24;
+type ThreadName = arrayvec::ArrayVec<u8, NAME_LEN>;
+
 unsafe impl Sync for JemWrapAllocator {}
 
-fn match_thread_name_safely(stats: &MemPoolStats) -> Option<&Counters> {
-    let mut name_buf = [0u8; 64];
-    let name: &str;
-    unsafe {
-        let res = libc::pthread_getname_np(
-            libc::pthread_self(),
-            (&mut name_buf).as_mut_ptr() as *mut i8,
-            name_buf.len(),
-        );
-        if res != 0 {
-            return None;
-        }
-        let name_len = memchr::memchr(0, &name_buf).unwrap_or(name_buf.len());
-        name = std::str::from_utf8_unchecked(&name_buf[0..name_len]);
-    }
+fn match_thread_name_safely(stats: &MemPoolStats, insert_if_missing: bool) -> Option<&Counters> {
+    let tid = unsafe { libc::pthread_self() };
+    let name = {
+        let mut name_lock = SELF.tid_to_name.lock().unwrap();
+        name_lock
+            .lookup(|e| if e.0 == tid { Some(e.1.clone()) } else { None })
+            .unwrap_or_else(|| {
+                let mut name_buf = ThreadName::new();
+                unsafe {
+                    name_buf.set_len(NAME_LEN);
+                    let res = libc::pthread_getname_np(
+                        libc::pthread_self(),
+                        name_buf.as_mut_ptr() as *mut i8,
+                        name_buf.capacity(),
+                    );
+                    if res != 0 {
+                        return name_buf;
+                    }
+                    let name_len = memchr::memchr(0, &name_buf).unwrap_or(name_buf.len());
+                    name_buf.set_len(name_len);
+                }
+                if insert_if_missing {
+                    name_lock.insert((tid, name_buf.clone()));
+                }
+                name_buf
+            })
+    };
 
     for (prefix, stats) in stats.data.iter() {
         if !name.starts_with(prefix) {
@@ -182,7 +206,7 @@ unsafe impl GlobalAlloc for JemWrapAllocator {
         SELF.process_stats.alloc(layout.size());
         if let Ok(stats) = SELF.named_thread_stats.try_read() {
             if let Some(stats) = stats.as_ref() {
-                if let Some(stats) = match_thread_name_safely(stats) {
+                if let Some(stats) = match_thread_name_safely(stats, true) {
                     stats.alloc(layout.size());
                     return alloc;
                 }
@@ -199,7 +223,7 @@ unsafe impl GlobalAlloc for JemWrapAllocator {
         SELF.process_stats.dealloc(layout.size());
         if let Ok(stats) = SELF.named_thread_stats.try_read() {
             if let Some(stats) = stats.as_ref() {
-                if let Some(stats) = match_thread_name_safely(stats) {
+                if let Some(stats) = match_thread_name_safely(stats, false) {
                     stats.dealloc(layout.size());
                     return;
                 }
