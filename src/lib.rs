@@ -148,6 +148,23 @@ pub fn deinit_allocator() -> MemPoolStats {
 
 unsafe impl Sync for JemWrapAllocator {}
 
+fn match_thread_name_safely(stats: &MemPoolStats) -> Option<&Counters> {
+    std::panic::catch_unwind(|| {
+        let thread = std::thread::current();
+        if let Some(name) = thread.name() {
+            for (prefix, stats) in stats.data.iter() {
+                if !name.starts_with(prefix) {
+                    continue;
+                }
+                return Some(stats);
+            }
+        }
+        return None;
+    })
+    .ok()
+    .flatten()
+}
+
 unsafe impl GlobalAlloc for JemWrapAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let alloc = self.jemalloc.alloc(layout);
@@ -157,15 +174,9 @@ unsafe impl GlobalAlloc for JemWrapAllocator {
         SELF.process_stats.alloc(layout.size());
         if let Ok(stats) = SELF.named_thread_stats.try_read() {
             if let Some(stats) = stats.as_ref() {
-                let thread = std::thread::current();
-                if let Some(name) = thread.name() {
-                    for (prefix, stats) in stats.data.iter() {
-                        if !name.starts_with(prefix) {
-                            continue;
-                        }
-                        stats.alloc(layout.size());
-                        return alloc;
-                    }
+                if let Some(stats) = match_thread_name_safely(stats) {
+                    stats.alloc(layout.size());
+                    return alloc;
                 }
             }
         }
@@ -180,14 +191,9 @@ unsafe impl GlobalAlloc for JemWrapAllocator {
         SELF.process_stats.dealloc(layout.size());
         if let Ok(stats) = SELF.named_thread_stats.try_read() {
             if let Some(stats) = stats.as_ref() {
-                let thread = std::thread::current();
-                if let Some(name) = thread.name() {
-                    for (prefix, stats) in stats.data.iter() {
-                        if !name.starts_with(prefix) {
-                            continue;
-                        }
-                        stats.dealloc(layout.size())
-                    }
+                if let Some(stats) = match_thread_name_safely(stats) {
+                    stats.dealloc(layout.size());
+                    return;
                 }
             }
         }
