@@ -149,20 +149,28 @@ pub fn deinit_allocator() -> MemPoolStats {
 unsafe impl Sync for JemWrapAllocator {}
 
 fn match_thread_name_safely(stats: &MemPoolStats) -> Option<&Counters> {
-    std::panic::catch_unwind(|| {
-        let thread = std::thread::current();
-        if let Some(name) = thread.name() {
-            for (prefix, stats) in stats.data.iter() {
-                if !name.starts_with(prefix) {
-                    continue;
-                }
-                return Some(stats);
-            }
+    let mut name_buf = [0u8; 64];
+    let name: &str;
+    unsafe {
+        let res = libc::pthread_getname_np(
+            libc::pthread_self(),
+            (&mut name_buf).as_mut_ptr() as *mut i8,
+            name_buf.len(),
+        );
+        if res != 0 {
+            return None;
         }
-        return None;
-    })
-    .ok()
-    .flatten()
+        let name_len = memchr::memchr(0, &name_buf).unwrap_or(name_buf.len());
+        name = std::str::from_utf8_unchecked(&name_buf[0..name_len]);
+    }
+
+    for (prefix, stats) in stats.data.iter() {
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        return Some(stats);
+    }
+    return None;
 }
 
 unsafe impl GlobalAlloc for JemWrapAllocator {
