@@ -44,6 +44,15 @@ pub struct Counters {
     bytes_deallocated_total: AtomicUsize,
 }
 
+pub struct CountersView {
+    pub allocations_balance: isize,
+    pub allocations_total: usize,
+    pub deallocations_total: usize,
+    pub bytes_balance: isize,
+    pub bytes_allocated_total: usize,
+    pub bytes_deallocated_total: usize,
+}
+
 impl Default for Counters {
     fn default() -> Self {
         Self::new()
@@ -51,6 +60,17 @@ impl Default for Counters {
 }
 
 impl Counters {
+    pub fn view(&self) -> CountersView {
+        CountersView {
+            allocations_balance: self.allocations_balance.load(Ordering::Relaxed),
+            allocations_total: self.allocations_total.load(Ordering::Relaxed),
+            deallocations_total: self.deallocations_total.load(Ordering::Relaxed),
+            bytes_balance: self.bytes_balance.load(Ordering::Relaxed),
+            bytes_allocated_total: self.bytes_allocated_total.load(Ordering::Relaxed),
+            bytes_deallocated_total: self.bytes_deallocated_total.load(Ordering::Relaxed),
+        }
+    }
+
     const fn new() -> Self {
         Self {
             allocations_balance: AtomicIsize::new(0),
@@ -100,7 +120,7 @@ struct JemWrapStats {
     pub process_stats: Counters,
 }
 
-pub fn view_allocations(f: impl Fn(&MemPoolStats)) {
+pub fn view_allocations(f: impl FnOnce(&MemPoolStats)) {
     let lock_guard = &SELF.named_thread_stats.read().unwrap();
     if let Some(stats) = lock_guard.as_ref() {
         f(stats);
