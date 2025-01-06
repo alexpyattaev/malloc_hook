@@ -162,34 +162,34 @@ unsafe impl Sync for JemWrapAllocator {}
 
 fn match_thread_name_safely(stats: &MemPoolStats, insert_if_missing: bool) -> Option<&Counters> {
     let tid = unsafe { libc::pthread_self() };
-    let name = SELF
-        .tid_to_name
-        .lock()
-        .unwrap()
-        .lookup(|e| if e.0 == tid { Some(e.1.clone()) } else { None })
-        .unwrap_or_else(|| {
-            let mut name_buf = ThreadName::new();
-            unsafe {
-                name_buf.set_len(NAME_LEN);
-                let res = libc::pthread_getname_np(
-                    libc::pthread_self(),
-                    name_buf.as_mut_ptr() as *mut i8,
-                    name_buf.capacity(),
-                );
-                if res != 0 {
-                    return name_buf;
-                }
-                let name_len = memchr::memchr(0, &name_buf).unwrap_or(name_buf.len());
-                name_buf.set_len(name_len);
+    let name =
+        SELF.tid_to_name
+            .lock()
+            .unwrap()
+            .lookup(|e| if e.0 == tid { Some(e.1.clone()) } else { None });
+    let name = name.unwrap_or_else(|| {
+        let mut name_buf = ThreadName::new();
+        unsafe {
+            name_buf.set_len(NAME_LEN);
+            let res = libc::pthread_getname_np(
+                libc::pthread_self(),
+                name_buf.as_mut_ptr() as *mut i8,
+                name_buf.capacity(),
+            );
+            if res != 0 {
+                return name_buf;
             }
-            if insert_if_missing {
-                SELF.tid_to_name
-                    .lock()
-                    .unwrap()
-                    .insert((tid, name_buf.clone()));
-            }
-            name_buf
-        });
+            let name_len = memchr::memchr(0, &name_buf).unwrap_or(name_buf.len());
+            name_buf.set_len(name_len);
+        }
+        if insert_if_missing {
+            SELF.tid_to_name
+                .lock()
+                .unwrap()
+                .insert((tid, name_buf.clone()));
+        }
+        name_buf
+    });
 
     for (prefix, stats) in stats.data.iter() {
         if !name.starts_with(prefix) {
