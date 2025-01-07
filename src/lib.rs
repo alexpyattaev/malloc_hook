@@ -22,7 +22,7 @@ pub struct extent_hooks_s {
 }*/
 use std::alloc::{GlobalAlloc, Layout};
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::sync::atomic::AtomicIsize;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -35,7 +35,7 @@ static SELF: JemWrapStats = JemWrapStats {
     process_stats: Counters::new(),
 };
 thread_local! (
-    static THREAD_NAME: Cell<ThreadName> = Cell::new(ThreadName::new())
+    static THREAD_NAME: RefCell<ThreadName> = RefCell::new(ThreadName::new())
 );
 
 #[derive(Debug)]
@@ -163,29 +163,26 @@ unsafe impl Sync for JemWrapAllocator {}
 fn match_thread_name_safely(stats: &MemPoolStats, insert_if_missing: bool) -> Option<&Counters> {
     let name: Option<ThreadName> = THREAD_NAME
         .try_with(|v| {
-            let mut name = v.take();
+            let mut name = v.borrow_mut();
             if name.is_empty() {
                 if insert_if_missing {
-                    let mut name_buf = ThreadName::new();
                     unsafe {
-                        name_buf.set_len(NAME_LEN);
+                        name.set_len(NAME_LEN);
                         let res = libc::pthread_getname_np(
                             libc::pthread_self(),
-                            name_buf.as_mut_ptr() as *mut i8,
-                            name_buf.capacity(),
+                            name.as_mut_ptr() as *mut i8,
+                            name.capacity(),
                         );
                         if res == 0 {
-                            let name_len = memchr::memchr(0, &name_buf).unwrap_or(name_buf.len());
-                            name_buf.set_len(name_len);
+                            let name_len = memchr::memchr(0, &name).unwrap_or(name.len());
+                            name.set_len(name_len);
                         }
                     }
-                    name = name_buf;
                 } else {
                     return None;
                 }
             }
-            v.set(name.clone());
-            Some(name)
+            Some(name.clone())
         })
         .ok()
         .flatten();
