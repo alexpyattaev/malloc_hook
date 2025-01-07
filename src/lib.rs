@@ -34,9 +34,9 @@ static SELF: JemWrapStats = JemWrapStats {
     unnamed_thread_stats: Counters::new(),
     process_stats: Counters::new(),
 };
-thread_local! {
-    static THREAD_NAME: Cell<ThreadName> = Cell::new(ThreadName::new());
-}
+thread_local! (
+    static THREAD_NAME: Cell<ThreadName> = Cell::new(ThreadName::new())
+);
 
 #[derive(Debug)]
 pub struct Counters {
@@ -161,35 +161,48 @@ type ThreadName = arrayvec::ArrayVec<u8, NAME_LEN>;
 unsafe impl Sync for JemWrapAllocator {}
 
 fn match_thread_name_safely(stats: &MemPoolStats, insert_if_missing: bool) -> Option<&Counters> {
-    let mut name = THREAD_NAME.take();
-    if name.is_empty() {
-        if insert_if_missing {
-            let mut name_buf = ThreadName::new();
-            unsafe {
-                name_buf.set_len(NAME_LEN);
-                let res = libc::pthread_getname_np(
-                    libc::pthread_self(),
-                    name_buf.as_mut_ptr() as *mut i8,
-                    name_buf.capacity(),
-                );
-                if res == 0 {
-                    let name_len = memchr::memchr(0, &name_buf).unwrap_or(name_buf.len());
-                    name_buf.set_len(name_len);
+    let name: Option<ThreadName> = THREAD_NAME
+        .try_with(|v| {
+            let mut name = v.take();
+            if name.is_empty() {
+                if insert_if_missing {
+                    let mut name_buf = ThreadName::new();
+                    unsafe {
+                        name_buf.set_len(NAME_LEN);
+                        let res = libc::pthread_getname_np(
+                            libc::pthread_self(),
+                            name_buf.as_mut_ptr() as *mut i8,
+                            name_buf.capacity(),
+                        );
+                        if res == 0 {
+                            let name_len = memchr::memchr(0, &name_buf).unwrap_or(name_buf.len());
+                            name_buf.set_len(name_len);
+                        }
+                    }
+                    name = name_buf;
+                } else {
+                    return None;
                 }
             }
-            name = name_buf;
-        } else {
+            v.set(name.clone());
+            Some(name)
+        })
+        .ok()
+        .flatten();
+    match name {
+        Some(name) => {
+            for (prefix, stats) in stats.data.iter() {
+                if !name.starts_with(prefix) {
+                    continue;
+                }
+                return Some(stats);
+            }
+            return None;
+        }
+        None => {
             return None;
         }
     }
-    THREAD_NAME.set(name.clone());
-    for (prefix, stats) in stats.data.iter() {
-        if !name.starts_with(prefix) {
-            continue;
-        }
-        return Some(stats);
-    }
-    return None;
 }
 
 unsafe impl GlobalAlloc for JemWrapAllocator {
