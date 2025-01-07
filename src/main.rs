@@ -1,6 +1,4 @@
-use std::time::Duration;
-
-use malloc_hook::*;
+use {malloc_hook::*, std::time::Duration};
 
 #[global_allocator]
 static GLOBAL_ALLOC_WRAP: JemWrapAllocator = JemWrapAllocator::new();
@@ -42,4 +40,5 @@ fn main() {
     jh1.join().unwrap();
     print_allocations();
     deinit_allocator();
+    dbg!(&SYSCALL_CNT);
 }
