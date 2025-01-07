@@ -1,5 +1,4 @@
 use jemallocator::Jemalloc;
-use uluru::LRUCache;
 
 //#[global_allocator]
 //static GLOBAL: Jemalloc = Jemalloc;
@@ -23,8 +22,8 @@ pub struct extent_hooks_s {
 }*/
 use std::alloc::{GlobalAlloc, Layout};
 
+use std::cell::Cell;
 use std::sync::atomic::AtomicIsize;
-use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     RwLock,
@@ -34,8 +33,10 @@ static SELF: JemWrapStats = JemWrapStats {
     named_thread_stats: RwLock::new(None),
     unnamed_thread_stats: Counters::new(),
     process_stats: Counters::new(),
-    tid_to_name: Mutex::new(LRUCache::new()),
 };
+thread_local! {
+    static THREAD_NAME: Cell<ThreadName> = Cell::new(ThreadName::new());
+}
 
 #[derive(Debug)]
 pub struct Counters {
@@ -121,7 +122,6 @@ struct JemWrapStats {
     pub named_thread_stats: RwLock<Option<MemPoolStats>>,
     pub unnamed_thread_stats: Counters,
     pub process_stats: Counters,
-    pub tid_to_name: Mutex<LRUCache<(u64, ThreadName), 512>>,
 }
 
 pub fn view_allocations(f: impl FnOnce(&MemPoolStats)) {
@@ -161,36 +161,28 @@ type ThreadName = arrayvec::ArrayVec<u8, NAME_LEN>;
 unsafe impl Sync for JemWrapAllocator {}
 
 fn match_thread_name_safely(stats: &MemPoolStats, insert_if_missing: bool) -> Option<&Counters> {
-    let tid = unsafe { libc::pthread_self() };
-    let name =
-        SELF.tid_to_name
-            .lock()
-            .unwrap()
-            .lookup(|e| if e.0 == tid { Some(e.1.clone()) } else { None });
-    let name = name.unwrap_or_else(|| {
-        let mut name_buf = ThreadName::new();
-        unsafe {
-            name_buf.set_len(NAME_LEN);
-            let res = libc::pthread_getname_np(
-                libc::pthread_self(),
-                name_buf.as_mut_ptr() as *mut i8,
-                name_buf.capacity(),
-            );
-            if res != 0 {
-                return name_buf;
-            }
-            let name_len = memchr::memchr(0, &name_buf).unwrap_or(name_buf.len());
-            name_buf.set_len(name_len);
-        }
+    let mut name = THREAD_NAME.take();
+    if name.is_empty() {
         if insert_if_missing {
-            SELF.tid_to_name
-                .lock()
-                .unwrap()
-                .insert((tid, name_buf.clone()));
+            let mut name_buf = ThreadName::new();
+            unsafe {
+                name_buf.set_len(NAME_LEN);
+                let res = libc::pthread_getname_np(
+                    libc::pthread_self(),
+                    name_buf.as_mut_ptr() as *mut i8,
+                    name_buf.capacity(),
+                );
+                if res == 0 {
+                    let name_len = memchr::memchr(0, &name_buf).unwrap_or(name_buf.len());
+                    name_buf.set_len(name_len);
+                }
+            }
+            name = name_buf;
+        } else {
+            return None;
         }
-        name_buf
-    });
-
+    }
+    THREAD_NAME.set(name.clone());
     for (prefix, stats) in stats.data.iter() {
         if !name.starts_with(prefix) {
             continue;
